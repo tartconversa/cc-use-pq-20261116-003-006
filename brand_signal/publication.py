@@ -5,6 +5,7 @@ import json
 import uuid
 from .analytics import Analytics, days_between
 from .errors import require
+from .settlements import Settlements
 from .store import Store, now
 
 
@@ -12,6 +13,7 @@ class Publication:
     def __init__(self, store: Store):
         self.store = store
         self.analytics = Analytics(store)
+        self.settlements = Settlements(store)
 
     @staticmethod
     def head(db, market: str) -> int:
@@ -68,8 +70,9 @@ class Publication:
             db.execute("INSERT INTO publication_rows(market,version,day,product,payload) SELECT ?,?,day,product,payload FROM candidate_rows WHERE candidate_id=?", (market, version, candidate_id))
             db.execute("INSERT INTO publication_heads(market,version) VALUES(?,?) ON CONFLICT(market) DO UPDATE SET version=excluded.version", (market, version))
             db.execute("UPDATE candidates SET status='published' WHERE id=?", (candidate_id,))
-            self.store.audit(db, "published", market, {"version": version, "candidate": candidate_id, "source_revision": expected_source_revision})
-            return {"market": market, "version": version, "candidate_id": candidate_id, "source_revision": expected_source_revision}
+            late_included = self.settlements.include_in_publication(db, market, version, candidate)
+            self.store.audit(db, "published", market, {"version": version, "candidate": candidate_id, "source_revision": expected_source_revision, "late_included": late_included})
+            return {"market": market, "version": version, "candidate_id": candidate_id, "source_revision": expected_source_revision, "late_included": late_included}
 
     def read(self, market: str, version: int) -> dict:
         with self.store.read() as db:

@@ -35,6 +35,11 @@ CREATE TABLE IF NOT EXISTS investigations(id TEXT PRIMARY KEY, market TEXT NOT N
 CREATE TABLE IF NOT EXISTS investigation_history(investigation_id TEXT NOT NULL REFERENCES investigations(id), revision INTEGER NOT NULL, action TEXT NOT NULL, at TEXT NOT NULL, owner TEXT NOT NULL, note TEXT NOT NULL, PRIMARY KEY(investigation_id,revision));
 CREATE TABLE IF NOT EXISTS market_rollups(market TEXT NOT NULL, version INTEGER NOT NULL, day TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(market,version,day));
 CREATE TABLE IF NOT EXISTS source_mappings(source TEXT NOT NULL, external_id TEXT NOT NULL, device_id TEXT NOT NULL REFERENCES devices(id), valid_from TEXT NOT NULL, valid_to TEXT, PRIMARY KEY(source,external_id,valid_from));
+CREATE TABLE IF NOT EXISTS settlement_windows(id TEXT PRIMARY KEY, market TEXT NOT NULL REFERENCES markets(code), day TEXT NOT NULL, status TEXT NOT NULL, revision INTEGER NOT NULL, head_version INTEGER, opened_at TEXT NOT NULL, closed_at TEXT, reopened_at TEXT, last_closed_at TEXT, settled_issues_json TEXT, UNIQUE(market,day));
+CREATE TABLE IF NOT EXISTS late_arrivals(id TEXT PRIMARY KEY, window_id TEXT NOT NULL REFERENCES settlement_windows(id), source TEXT NOT NULL, event_key TEXT NOT NULL, record_id TEXT NOT NULL, batch_id TEXT NOT NULL, day TEXT NOT NULL, device_id TEXT NOT NULL, status TEXT NOT NULL, source_revision INTEGER NOT NULL, received_at TEXT NOT NULL, UNIQUE(source,event_key));
+CREATE TABLE IF NOT EXISTS late_publication_inclusions(market TEXT NOT NULL, version INTEGER NOT NULL, late_id TEXT NOT NULL REFERENCES late_arrivals(id), included_at TEXT NOT NULL, PRIMARY KEY(market,version,late_id), UNIQUE(late_id,version));
+CREATE INDEX IF NOT EXISTS idx_late_window ON late_arrivals(window_id,status);
+CREATE INDEX IF NOT EXISTS idx_late_pending ON late_arrivals(day,status);
 CREATE INDEX IF NOT EXISTS idx_devices_market ON devices(market,product);
 CREATE INDEX IF NOT EXISTS idx_tickets_device ON tickets(device_id,opened_at);
 CREATE INDEX IF NOT EXISTS idx_telemetry_device ON telemetry(device_id,observed_at);

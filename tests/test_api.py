@@ -62,3 +62,41 @@ class ApiTests(unittest.TestCase):
         stale = self.client.post("/tickets/t1/transitions", json={"action": "resolve", "at": "2026-10-21T01:00:00Z", "expected_revision": 1})
         self.assertEqual(stale.status_code, 409)
         self.assertEqual(stale.json()["error"], "stale_ticket")
+
+    def test_http_settlement_late_data_workflow(self):
+        self.seed()
+        day = "2026-10-21"
+        opened = self.client.post("/settlements/windows", json={"market": "ES", "day": day})
+        self.assertEqual(opened.status_code, 200)
+        window_id = opened.json()["id"]
+        # 关窗后补传计量
+        closed = self.client.post(f"/settlements/windows/{window_id}/close", json={"expected_revision": 1})
+        self.assertEqual(closed.status_code, 200)
+        self.assertEqual(closed.json()["status"], "closed")
+        upload = self.client.post("/ingest/telemetry", json={"request_key": "late-1", "rows": [
+            {"event_key": "m-late", "id": "m1", "device_id": "d1", "observed_at": "2026-10-21T08:00:00Z", "run_hours": 12, "downtime_hours": 2}
+        ]})
+        self.assertEqual(upload.status_code, 200)
+        self.assertTrue(upload.json()["rows"][0]["is_late"])
+        pending = self.client.get("/settlements/ES/pending")
+        self.assertEqual(len(pending.json()["pending"]), 1)
+        impact = self.client.get(f"/settlements/windows/{window_id}/impact")
+        self.assertEqual(impact.status_code, 200)
+        self.assertEqual(impact.json()["late_by_source"], {"telemetry": 1})
+        # 重开窗口
+        reopen = self.client.post(f"/settlements/windows/{window_id}/reopen", json={"expected_revision": 2, "reason": "review"})
+        self.assertEqual(reopen.status_code, 200)
+        self.assertEqual(reopen.json()["status"], "reopened")
+        # 错误修订号被 CAS 拒绝
+        stale = self.client.post(f"/settlements/windows/{window_id}/close", json={"expected_revision": 2})
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(stale.json()["error"], "stale_window")
+        # 发布修订版本后迟到事件纳入
+        self.client.post(f"/settlements/windows/{window_id}/close", json={"expected_revision": 3})
+        candidate = self.client.post("/candidates", json={"market": "ES", "from_day": day, "to_day": day, "expected_head": 0})
+        published = self.client.post(f"/candidates/{candidate.json()['id']}/publish", json={"expected_head": 0, "expected_source_revision": candidate.json()["source_revision"]})
+        self.assertEqual(published.status_code, 200)
+        self.assertEqual(published.json()["late_included"], 1)
+        self.assertEqual(self.client.get("/settlements/ES/pending").json()["pending"], [])
+        late = self.client.get(f"/settlements/windows/{window_id}/late")
+        self.assertEqual(late.json()["late_arrivals"][0]["status"], "included")

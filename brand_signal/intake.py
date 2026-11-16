@@ -8,6 +8,8 @@ from .store import Store, now
 from .telemetry import Telemetry
 from .contracts import Contracts
 from .mappings import Mappings
+from .settlements import Settlements
+from .catalog import market_day
 
 
 SOURCES = {"tickets", "telemetry"}
@@ -28,6 +30,7 @@ class Intake:
         self.telemetry = Telemetry(store)
         self.contracts = Contracts(store)
         self.mappings = Mappings(store)
+        self.settlements = Settlements(store)
 
     def _mapped(self, db, source: str, row: dict) -> dict:
         if "external_device_id" not in row:
@@ -55,10 +58,31 @@ class Intake:
                     normalized, _ = self.contracts.normalize(db, source, row)
                     normalized = self._mapped(db, source, normalized)
                     (self.service.validate_open if source == "tickets" else self.telemetry.validate)(db, normalized)
-                    outcomes.append({"row": index, "status": "ready"})
+                    outcome = {"row": index, "status": "ready"}
+                    if self._late_window(db, source, normalized) is not None:
+                        outcome["is_late"] = True
+                    outcomes.append(outcome)
                 except DomainError as exc:
                     outcomes.append({"row": index, "status": "rejected", "reason": exc.code})
-        return {"source": source, "rows": outcomes, "ready": sum(r["status"] == "ready" for r in outcomes)}
+        ready = [item for item in outcomes if item["status"] == "ready"]
+        return {"source": source, "rows": outcomes, "ready": len(ready), "late": sum(1 for item in ready if item.get("is_late"))}
+
+    @staticmethod
+    def _late_window(db, source: str, normalized: dict):
+        """事件所属设备市场的本地日落入已结算窗口时返回该窗口，否则 None。"""
+        device_id = normalized.get("device_id")
+        timestamp = normalized.get("opened_at") if source == "tickets" else normalized.get("observed_at")
+        if not device_id or not timestamp:
+            return None
+        zone = db.execute("SELECT m.timezone FROM devices d JOIN markets m ON m.code=d.market WHERE d.id=?", (device_id,)).fetchone()
+        if zone is None:
+            return None
+        local_day = market_day(timestamp, zone[0])
+        return db.execute(
+            "SELECT w.* FROM devices d JOIN settlement_windows w ON w.market=d.market "
+            "WHERE d.id=? AND w.day=? AND w.status IN ('closed','reopened')",
+            (device_id, local_day),
+        ).fetchone()
 
     def submit(self, source: str, request_key: str, rows: list[dict]) -> dict:
         require(source in SOURCES, "invalid_source", "source unknown")
@@ -95,6 +119,13 @@ class Intake:
                     accepted = (self.service.accept_open if source == "tickets" else self.telemetry.accept)(db, normalized, batch_id)
                     db.execute("INSERT INTO source_events VALUES(?,?,?,?)", (source, key, row_digest, accepted["id"]))
                     self.store.audit(db, "row_contract", accepted["id"], {"source": source, "contract_version": contract_version, "batch": batch_id})
+                    window = self._late_window(db, source, normalized)
+                    if window is not None:
+                        self.settlements.register_late(
+                            db, window=window, source=source, event_key=key, record_id=accepted["id"],
+                            batch_id=batch_id, device_id=accepted["device_id"],
+                            source_revision=self.store.revision(db),
+                        )
                     db.execute("RELEASE row_input")
                 except DomainError as exc:
                     db.execute("ROLLBACK TO row_input")
@@ -103,16 +134,27 @@ class Intake:
                 db.execute("INSERT INTO batch_rows VALUES(?,?,?,?,?,?)", (batch_id, index, key, status, reason, canonical(row)))
             accepted = db.execute("SELECT count(*) FROM batch_rows WHERE batch_id=? AND status='accepted'", (batch_id,)).fetchone()[0]
             rejected = len(rows) - accepted
+            late = db.execute(
+                "SELECT count(*) FROM late_arrivals WHERE batch_id=?", (batch_id,)
+            ).fetchone()[0]
             db.execute("UPDATE batches SET status='completed',accepted=?,rejected=? WHERE id=?", (accepted, rejected, batch_id))
-            self.store.audit(db, "batch_completed", batch_id, {"source": source, "accepted": accepted, "rejected": rejected})
+            self.store.audit(db, "batch_completed", batch_id, {"source": source, "accepted": accepted, "rejected": rejected, "late": late})
             result = self._result(db, batch_id)
             result["replay"] = False
             return result
 
-    @staticmethod
-    def _result(db, batch_id: str) -> dict:
+    def _result(self, db, batch_id: str) -> dict:
         batch = dict(db.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone())
-        batch["rows"] = [dict(row) for row in db.execute("SELECT row_no,event_key,status,reason FROM batch_rows WHERE batch_id=? ORDER BY row_no", (batch_id,))]
+        rows = []
+        for row in db.execute("SELECT row_no,event_key,status,reason FROM batch_rows WHERE batch_id=? ORDER BY row_no", (batch_id,)):
+            item = dict(row)
+            if item["status"] == "accepted" and item["event_key"]:
+                item["is_late"] = self.settlements.is_late_event(db, batch["source"], item["event_key"])
+            else:
+                item["is_late"] = False
+            rows.append(item)
+        batch["rows"] = rows
+        batch["late"] = sum(1 for item in rows if item["is_late"])
         return batch
 
     def batch(self, batch_id: str) -> dict:

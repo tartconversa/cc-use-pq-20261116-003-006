@@ -13,42 +13,52 @@ class Reconciliation:
         self.store = store
         self.analytics = Analytics(store)
 
+    def _issues(self, db, market: str, zone: str, valid_days: set[str], metrics: list[dict]) -> list[dict]:
+        issues = []
+        devices = {r["id"]: r for r in db.execute("SELECT * FROM devices WHERE market=?", (market,))}
+        meters = defaultdict(list)
+        for row in db.execute("SELECT e.* FROM telemetry e JOIN devices d ON d.id=e.device_id WHERE d.market=?", (market,)):
+            local = market_day(row["observed_at"], zone)
+            if local in valid_days:
+                meters[(row["device_id"], local)].append(row)
+        cases = defaultdict(list)
+        for row in db.execute("SELECT t.* FROM tickets t JOIN devices d ON d.id=t.device_id WHERE d.market=?", (market,)):
+            local = market_day(row["opened_at"], zone)
+            if local in valid_days:
+                cases[(row["device_id"], local)].append(row)
+        for device in devices.values():
+            for day in sorted(valid_days):
+                key = (device["id"], day)
+                readings = meters[key]
+                opened = cases[key]
+                if len(readings) > 1:
+                    issues.append({"kind": "multiple_meter_events", "device": device["id"], "day": day, "events": [r["id"] for r in readings]})
+                if opened and not readings:
+                    issues.append({"kind": "ticket_without_meter", "device": device["id"], "day": day, "tickets": [r["id"] for r in opened]})
+                for meter in readings:
+                    if meter["downtime_hours"] > 0 and not opened:
+                        issues.append({"kind": "downtime_without_ticket", "device": device["id"], "day": day, "event": meter["id"]})
+        for row in metrics:
+            if row["active_devices"] and not row["devices_reporting"]:
+                issues.append({"kind": "market_meter_gap", "product": row["product"], "day": row["day"], "active_devices": row["active_devices"]})
+            if row["ticket_open_at_end"] > row["active_devices"]:
+                issues.append({"kind": "case_load_exceeds_fleet", "product": row["product"], "day": row["day"], "open_cases": row["ticket_open_at_end"]})
+        issues.sort(key=lambda item: (item["day"], item["kind"], item.get("device", "")))
+        return issues
+
+    @staticmethod
+    def issue_key(issue: dict) -> tuple:
+        target = issue.get("device") or issue.get("product") or ""
+        signature = issue.get("event") or ",".join(issue.get("events") or issue.get("tickets") or []) or str(issue.get("active_devices") or issue.get("open_cases") or "")
+        return issue["day"], issue["kind"], target, signature
+
     def inspect(self, market: str, from_day: str, to_day: str) -> dict:
         with self.store.read() as db:
             zone = db.execute("SELECT timezone FROM markets WHERE code=?", (market,)).fetchone()
             require(zone is not None, "unknown_market", "market unknown", 404)
             valid_days = set(days_between(from_day, to_day))
             metrics = self.analytics.calculate(db, market, from_day, to_day)
-            issues = []
-            devices = {r["id"]: r for r in db.execute("SELECT * FROM devices WHERE market=?", (market,))}
-            meters = defaultdict(list)
-            for row in db.execute("SELECT e.* FROM telemetry e JOIN devices d ON d.id=e.device_id WHERE d.market=?", (market,)):
-                local = market_day(row["observed_at"], zone[0])
-                if local in valid_days:
-                    meters[(row["device_id"], local)].append(row)
-            cases = defaultdict(list)
-            for row in db.execute("SELECT t.* FROM tickets t JOIN devices d ON d.id=t.device_id WHERE d.market=?", (market,)):
-                local = market_day(row["opened_at"], zone[0])
-                if local in valid_days:
-                    cases[(row["device_id"], local)].append(row)
-            for device in devices.values():
-                for day in sorted(valid_days):
-                    key = (device["id"], day)
-                    readings = meters[key]
-                    opened = cases[key]
-                    if len(readings) > 1:
-                        issues.append({"kind": "multiple_meter_events", "device": device["id"], "day": day, "events": [r["id"] for r in readings]})
-                    if opened and not readings:
-                        issues.append({"kind": "ticket_without_meter", "device": device["id"], "day": day, "tickets": [r["id"] for r in opened]})
-                    for meter in readings:
-                        if meter["downtime_hours"] > 0 and not opened:
-                            issues.append({"kind": "downtime_without_ticket", "device": device["id"], "day": day, "event": meter["id"]})
-            for row in metrics:
-                if row["active_devices"] and not row["devices_reporting"]:
-                    issues.append({"kind": "market_meter_gap", "product": row["product"], "day": row["day"], "active_devices": row["active_devices"]})
-                if row["ticket_open_at_end"] > row["active_devices"]:
-                    issues.append({"kind": "case_load_exceeds_fleet", "product": row["product"], "day": row["day"], "open_cases": row["ticket_open_at_end"]})
-            issues.sort(key=lambda item: (item["day"], item["kind"], item.get("device", "")))
+            issues = self._issues(db, market, zone[0], valid_days, metrics)
             return {"market": market, "from_day": from_day, "to_day": to_day, "source_revision": self.store.revision(db), "issues": issues, "issue_count": len(issues)}
 
     def save(self, market: str, from_day: str, to_day: str, expected_source_revision: int) -> dict:

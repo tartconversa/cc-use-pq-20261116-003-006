@@ -24,6 +24,7 @@ from .lineage import Lineage
 from .rollups import Rollups
 from .sampling import Sampling
 from .mappings import Mappings
+from .settlements import Settlements
 
 
 class MarketIn(BaseModel):
@@ -142,6 +143,16 @@ class MappingIn(BaseModel):
     valid_to: str | None = None
 
 
+class WindowIn(BaseModel):
+    market: str
+    day: str
+
+
+class WindowTransitionIn(BaseModel):
+    expected_revision: int
+    reason: str = ""
+
+
 def create_app(path: str | None = None) -> FastAPI:
     db = Store(path or os.environ.get("BRAND_SIGNAL_DB", "/tmp/brand-signal.sqlite3"))
     catalog = Catalog(db)
@@ -163,6 +174,7 @@ def create_app(path: str | None = None) -> FastAPI:
     rollups = Rollups(db)
     sampling = Sampling(db)
     mappings = Mappings(db)
+    settlements = Settlements(db)
     app = FastAPI(title="Brand Signal Service Analytics", version="1.0")
     app.state.store = db
 
@@ -399,6 +411,38 @@ def create_app(path: str | None = None) -> FastAPI:
     @app.get("/mappings/{source}")
     def list_mappings(source: str, external_id: str | None = None):
         return mappings.list(source, external_id)
+
+    @app.post("/settlements/windows")
+    def open_window(body: WindowIn):
+        return settlements.open_window(body.market, body.day)
+
+    @app.get("/settlements/{market}/windows")
+    def list_windows(market: str, day: str | None = None, status: str | None = None):
+        return settlements.list_windows(market, day, status)
+
+    @app.get("/settlements/windows/{window_id}")
+    def get_window(window_id: str):
+        return settlements.get(window_id)
+
+    @app.post("/settlements/windows/{window_id}/close")
+    def close_window(window_id: str, body: WindowTransitionIn):
+        return settlements.close_window(window_id, body.expected_revision)
+
+    @app.post("/settlements/windows/{window_id}/reopen")
+    def reopen_window(window_id: str, body: WindowTransitionIn):
+        return settlements.reopen_window(window_id, body.expected_revision, body.reason)
+
+    @app.get("/settlements/windows/{window_id}/late")
+    def list_late(window_id: str, status: str | None = None):
+        return settlements.list_late(window_id, status)
+
+    @app.get("/settlements/windows/{window_id}/impact")
+    def window_impact(window_id: str):
+        return settlements.impact(window_id)
+
+    @app.get("/settlements/{market}/pending")
+    def pending_late(market: str):
+        return {"market": market, "pending": settlements.pending(market)}
 
     return app
 
